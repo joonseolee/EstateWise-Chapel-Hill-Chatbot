@@ -6,6 +6,38 @@ import {
 } from "../core/types.js";
 import { ToolClient } from "../mcp/ToolClient.js";
 
+function extractToolText(result: unknown) {
+  const res = result as any;
+  const content = Array.isArray(res?.content) ? res.content : [];
+  const block = content.find((c: any) => c?.type === "text");
+  if (block && typeof block.text === "string") return block.text;
+  try {
+    return JSON.stringify(result);
+  } catch (_err) {
+    return String(result);
+  }
+}
+
+/**
+ * Event payloads emitted during a streaming run.
+ */
+export type AgentStreamEvent =
+  | { type: "start"; goal: string; rounds: number }
+  | { type: "message"; message: AgentMessage }
+  | {
+      type: "tool";
+      name: string;
+      args: Record<string, unknown>;
+      resultText?: string;
+      ok: boolean;
+      error?: string;
+    }
+  | { type: "done"; history: AgentMessage[] };
+
+/**
+ * Orchestrates a round-based multi-agent loop. Supports both batch `run`
+ * and incremental `runStream` with per-message/tool events.
+ */
 export class AgentOrchestrator {
   private agents: Agent[] = [];
   private toolClient = new ToolClient();
@@ -16,6 +48,11 @@ export class AgentOrchestrator {
     return this;
   }
 
+  /**
+   * Run the orchestrator to completion and return the full message history.
+   * @param goal Freeform user instruction
+   * @param rounds Number of full agent passes (default 4)
+   */
   async run(goal: string, rounds = 4): Promise<AgentMessage[]> {
     await this.toolClient.start();
     const history: AgentMessage[] = [];
@@ -35,9 +72,7 @@ export class AgentOrchestrator {
         if (tool?.name) {
           try {
             const result = await this.callWithRetry(tool.name, tool.args || {});
-            const textBlock =
-              result?.content?.find((c: any) => c.type === "text")?.text ||
-              JSON.stringify(result);
+            const textBlock = extractToolText(result);
             history.push({
               from: agent.role,
               content: `Tool ${tool.name} result`,
@@ -56,6 +91,69 @@ export class AgentOrchestrator {
 
     await this.toolClient.stop();
     return history;
+  }
+
+  /**
+   * Stream a run via callback events. Emits start, each message, tool results,
+   * and a final done event with the full history.
+   */
+  async runStream(
+    goal: string,
+    rounds: number,
+    onEvent: (e: AgentStreamEvent) => void,
+  ): Promise<void> {
+    await this.toolClient.start();
+    const history: AgentMessage[] = [];
+    const ctx = ((): AgentContext => ({
+      goal,
+      history,
+      blackboard: this.blackboard,
+    }))();
+    onEvent({ type: "start", goal, rounds });
+
+    for (let i = 0; i < rounds; i++) {
+      for (const agent of this.agents) {
+        const msg = await agent.think(ctx);
+        history.push(msg);
+        onEvent({ type: "message", message: msg });
+
+        const tool = (msg.data as any)?.tool;
+        if (tool?.name) {
+          try {
+            const result = await this.callWithRetry(tool.name, tool.args || {});
+            const textBlock = extractToolText(result);
+            history.push({
+              from: agent.role,
+              content: `Tool ${tool.name} result`,
+              data: { result, resultText: textBlock },
+            });
+            onEvent({
+              type: "tool",
+              name: tool.name,
+              args: tool.args || {},
+              resultText: textBlock,
+              ok: true,
+            });
+            this.updateBlackboard(tool.name, textBlock);
+          } catch (err: any) {
+            history.push({
+              from: agent.role,
+              content: `Tool ${tool.name} error: ${err?.message || String(err)}`,
+            });
+            onEvent({
+              type: "tool",
+              name: tool.name,
+              args: tool.args || {},
+              ok: false,
+              error: err?.message || String(err),
+            });
+          }
+        }
+      }
+    }
+
+    await this.toolClient.stop();
+    onEvent({ type: "done", history });
   }
 
   private async callWithRetry(name: string, args: Record<string, unknown>) {
